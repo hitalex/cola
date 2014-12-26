@@ -39,6 +39,8 @@ from storage import DoesNotExist, Q, WeiboUser, Friend,\
                     MicroBlog, Geo, UserInfo, WorkInfo, EduInfo,\
                     Comment, Forward, Like, ValidationError
 from conf import fetch_forward, fetch_comment, fetch_like
+from conf import fetch_follows, fetch_fans
+from conf import MAX_WEIBO, MAX_FORWARDS, MAX_COMMENTS, MAX_LIKES, MAX_FOLLOWS, MAX_FANS
 
 try:
     from dateutil.parser import parse
@@ -51,22 +53,30 @@ class WeiboParser(Parser):
     def __init__(self, opener=None, url=None, bundle=None, **kwargs):
         super(WeiboParser, self).__init__(opener=opener, url=url, **kwargs)
         self.bundle = bundle
+        # 通过bundle的label属性将uid传递给WeiboUser
         self.uid = bundle.label
         self.opener.set_default_timeout(TIMEOUT)
+        self.crawled_num_lock = Lock()
         if not hasattr(self, 'logger') or self.logger is None:
             self.logger = get_logger(name='weibo_parser')
     
     def _check_url(self, dest_url, src_url):
+        # 判断参数前的url是否相同
         return dest_url.split('?')[0] == src_url.split('?')[0]
     
     def check(self, url, br):
+        # 判断是否是否发生了跳转
         dest_url = br.geturl()
         if not self._check_url(dest_url, url):
+            # 如果确实发生跳转，则判断是那种情况：未登录或用户不存在
             if dest_url.startswith('http://weibo.com/login.php'):
                 raise WeiboLoginFailure('Weibo not login or login expired')
             if dest_url.startswith('http://weibo.com/sorry?usernotexists'):
                 self.bundle.exists = False
                 return False
+                
+            #return False
+            
         return True
     
     def get_weibo_user(self):
@@ -74,6 +84,7 @@ class WeiboParser(Parser):
             return self.bundle.weibo_user
         
         try:
+            # 判断此bundle中weibo_user是否是mongoengine的类
             self.bundle.weibo_user = getattr(WeiboUser, 'objects').get(uid=self.uid)
         except DoesNotExist:
             self.bundle.weibo_user = WeiboUser(uid=self.uid)
@@ -88,10 +99,12 @@ class WeiboParser(Parser):
             self.bundle.last_error_page_times = 0
             
         if self.bundle.last_error_page_times >= 15:
+            self.logger.debug('Error when parsing: %s, error times: %d' % (url, self.bundle.last_error_page_times))
             raise e
         return [url, ], []
 
 class MicroBlogParser(WeiboParser):
+    
     def parse(self, url=None):
         if self.bundle.exists == False:
             return [], []
@@ -100,6 +113,7 @@ class MicroBlogParser(WeiboParser):
         params = urldecode(url)
         br = self.opener.browse_open(url)
 #         self.logger.debug('load %s finish' % url)
+        self.logger.debug('load %s finish: microblog list' % url)
         
         if not self.check(url, br):
             return [], []
@@ -132,6 +146,7 @@ class MicroBlogParser(WeiboParser):
         divs = soup.find_all('div', attrs={'class': 'WB_feed_type'},  mid=True)
         max_id = None
         next_urls = []
+        inc_num = 0 # 当前页面抓取的微博数
         for div in divs:
             mid = div['mid']
             if len(mid) == 0:
@@ -146,10 +161,16 @@ class MicroBlogParser(WeiboParser):
             if len(self.bundle.newest_mids) < 3:
                 self.bundle.newest_mids.append(mid)
             
+            # 创建一个微博类
             try:
                 mblog = getattr(MicroBlog, 'objects').get(Q(mid=mid)&Q(uid=self.uid))
+                # 如果微博已经存在，则直接忽略
+                continue
             except DoesNotExist:
                 mblog = MicroBlog(mid=mid, uid=self.uid)
+                # 添加抓取时间属性
+                mblog.crawling_date = datetime.now()
+                
             content_div = div.find('div', attrs={
                 'class': 'WB_text', 
                 'node-type': 'feed_list_content'
@@ -158,6 +179,10 @@ class MicroBlogParser(WeiboParser):
                 img.replace_with(img['title']);
             mblog.content = content_div.text
             is_forward = div.get('isforward') == '1'
+            # NOTE: 这里只处理原创微博，因为会抓取该微博的所有转发和评论
+            if is_forward:
+                continue
+                
             if is_forward:
                 mblog.omid = div['omid']
                 name_a = div.find('a', attrs={
@@ -189,17 +214,22 @@ class MicroBlogParser(WeiboParser):
             likes = likes.strip('(').strip(')')
             likes = 0 if len(likes) == 0 else int(likes)
             mblog.n_likes = likes
+            
             forwards = func_div.find('a', attrs={'action-type': action_type_re("forward")}).text
             if '(' not in forwards:
                 mblog.n_forwards = 0
             else:
                 mblog.n_forwards = int(forwards.strip().split('(', 1)[1].strip(')'))
+                
             comments = func_div.find('a', attrs={'action-type': action_type_re('comment')}).text
             if '(' not in comments:
                 mblog.n_comments = 0
             else:
                 mblog.n_comments = int(comments.strip().split('(', 1)[1].strip(')'))
                 
+            #TODO: 考虑如果转发数或者评论数太大，则忽略此微博
+            
+            
             # fetch geo info
             map_info = div.find("div", attrs={'class': 'map_data'})
             if map_info is not None:
@@ -210,6 +240,7 @@ class MicroBlogParser(WeiboParser):
                 mblog.geo = geo
             
             # fetch forwards and comments
+            # 抓取转发，评论信息
             if fetch_forward or fetch_comment or fetch_like:
                 query = {'id': mid, '_t': 0, '__rnd': int(time.time()*1000)}
                 query_str = urllib.urlencode(query)
@@ -226,13 +257,26 @@ class MicroBlogParser(WeiboParser):
                     next_urls.append(like_url)
             
             mblog.save()
+            inc_num += 1
         
         if 'pagebar' in params:
             params['max_id'] = max_id
         else:
             del params['max_id']
 #         self.logger.debug('parse %s finish' % url)
-                
+        self.logger.debug('parse %s finish and add %d microblogs.' % (url, inc_num))
+        
+        #"""
+        # 增加抓取微博的数量
+        self.crawled_num_lock.acquire()
+        self.bundle.current_crawled_num += inc_num
+        self.crawled_num_lock.release()
+        #"""
+        # 如果已经抓取了足够多微博数量，则停止
+        #print 'Current crawled microblog num:', self.bundle.current_crawled_num
+        if self.bundle.current_crawled_num > MAX_WEIBO:
+            finished = True
+        
         # if not has next page
         if len(divs) == 0 or finished:
             weibo_user = self.get_weibo_user()
@@ -243,9 +287,14 @@ class MicroBlogParser(WeiboParser):
                 weibo_user.newest_mids.pop()
             weibo_user.last_update = self.bundle.last_update
             weibo_user.save()
-            return [], []
+            finished = True
+            #return [], []
         
-        next_urls.append('%s?%s'%(url.split('?')[0], urllib.urlencode(params)))
+        if not finished:
+            # 添加下一页的URL
+            next_urls.append('%s?%s'%(url.split('?')[0], urllib.urlencode(params)))
+        
+        # 当微博抓取结束时，评论、转发、like的抓取可能并没有结束
         return next_urls, []
     
 class ForwardCommentLikeParser(WeiboParser):
@@ -289,12 +338,16 @@ class ForwardCommentLikeParser(WeiboParser):
         try:
             br = self.opener.browse_open(url)
 #             self.logger.debug('load %s finish' % url)
+            self.logger.debug('load %s finish: forward, comment and like.' % url)
             jsn = json.loads(br.response().read())
         except (ValueError, URLError) as e:
             return self._error(url, e)
         
+        # 返回的html页面信息
         soup = beautiful_soup(jsn['data']['html'])
+        # 当前页数
         current_page = jsn['data']['page']['pagenum']
+        # 总的页数
         n_pages = jsn['data']['page']['totalpage']
         
         if not self.check(url, br):
@@ -320,16 +373,29 @@ class ForwardCommentLikeParser(WeiboParser):
             for span in dl.find_all('span'): span.extract()
             instance.content = dl.text.strip()
         
+        finished = False
+        action_type = ''
+        inc_num = 0
+        action_list = []
         if url.startswith('http://weibo.com/aj/comment'):
             dls = soup.find_all('dl', mid=True)
+            action_type = 'comment'
             for dl in dls:
                 uid = dl.find('a', usercard=True)['usercard'].split("id=", 1)[1]
                 comment = Comment(uid=uid)
                 set_instance(comment, dl)
                 
                 mblog.comments.append(comment)
+                inc_num += 1
+                action_list = mblog.comments
+                #print 'Current comment count: ', len(mblog.comments)
+                if MAX_COMMENTS > 0 and len(mblog.comments) >= MAX_COMMENTS:
+                    finished = True
+                    break
+                    
         elif url.startswith('http://weibo.com/aj/mblog/info'):
             dls = soup.find_all('dl', mid=True)
+            action_type = 'forward'
             for dl in dls:
                 forward_again_a = dl.find('a', attrs={'action-type': re.compile("^(feed_list|fl)_forward$")})
                 uid = urldecode('?%s' % forward_again_a['action-data'])['uid']
@@ -337,21 +403,39 @@ class ForwardCommentLikeParser(WeiboParser):
                 set_instance(forward, dl)
                 
                 mblog.forwards.append(forward)
+                inc_num += 1
+                action_list = mblog.forwards
+                #print 'Current forwards count: ', len(mblog.forwards)
+                if MAX_FORWARDS > 0 and len(mblog.forwards) >= MAX_FORWARDS:
+                    finished = True
+                    break
+                    
         elif url.startswith('http://weibo.com/aj/like'):
             lis = soup.find_all('li', uid=True)
+            action_type = 'like'
             for li in lis:
                 like = Like(uid=li['uid'])
                 like.avatar = li.find('img')['src']
                 
                 mblog.likes.append(like)
+                inc_num += 1
+                action_list = mblog.likes
+                if MAX_LIKES > 0 and len(mblog.likes) >= MAX_LIKES:
+                    finished = True
+                    break
+                    
+        else:
+            self.logger.debug('[ForwardCommentLikeParser]parse %s error: Not match with forward, comment or like url pattern.' % (url))
         
         try:
             mblog.save()
 #             self.logger.debug('parse %s finish' % url)
+            self.logger.debug('parse %s finish: add %d %s, current num: %d' % (url, inc_num, action_type, len(action_list)))
         except ValidationError, e:
+            self.logger.debug('parse %s error' % (url))
             return self._error(url, e)
         
-        if current_page >= n_pages:
+        if current_page >= n_pages or finished:
             return [], []
         
         params = urldecode(url)
@@ -616,7 +700,7 @@ class UserFriendParser(WeiboParser):
         br, soup = None, None
         try:
             br = self.opener.browse_open(url)
-#             self.logger.debug('load %s finish' % url)
+            self.logger.debug('load %s finish' % url)
             soup = beautiful_soup(br.response().read())
         except Exception, e:
             return self._error(url, e)
@@ -655,6 +739,12 @@ class UserFriendParser(WeiboParser):
                 if data['pid'] == 'pl_relation_hisFans':
                     is_follow = False    
         
+        # 判断是否应该继续进行抓取
+        if is_follow and not fetch_follows:
+            return [], []
+        elif not is_follow and not fetch_fans:
+            return [], []
+        
         bundles = []
         ul = None
         try:
@@ -663,6 +753,8 @@ class UserFriendParser(WeiboParser):
                 ul = html.find(attrs={'class': 'follow_list', 'node-type': 'userListBox'})
         except AttributeError, e:
             if br.geturl().startswith('http://e.weibo.com'):
+                return [], []
+            if html is None:
                 return [], []
             return self._error(url, e)
         
@@ -681,6 +773,9 @@ class UserFriendParser(WeiboParser):
                 weibo_user.follows = []
             else:
                 weibo_user.fans = []
+                
+        friend_num = 0
+        finished = False # 是否抓取完毕
         for cls in ('S_line1', 'S_line2'):
             for li in ul.find_all(attrs={'class': cls, 'action-type': 'itemClick'}):
                 data = dict([l.split('=') for l in li['action-data'].split('&')])
@@ -689,31 +784,51 @@ class UserFriendParser(WeiboParser):
                 friend.uid = data['uid']
                 friend.nickname = data['fnick']
                 friend.sex = True if data['sex'] == u'm' else False
-                
-                bundles.append(WeiboUserBundle(str(friend.uid)))
+                # 判断数据库中是否已经存在了该用户，如果存在，则不将其添加到bundles
+                try:
+                    user_info = getattr(WeiboUser, 'objects').get(Q(uid=friend.uid))
+                    continue
+                except DoesNotExist:
+                    bundles.append(WeiboUserBundle(str(friend.uid)))
+                    self.logger.debug('Add to bundles: %s.' % (str(friend.uid)))
+                    
+                friend_num += 1
                 if is_follow:
                     weibo_user.follows.append(friend)
+                    if MAX_FOLLOWS > 0 and len(weibo_user.follows) >= MAX_FOLLOWS:
+                        finished = True
                 else:
                     weibo_user.fans.append(friend)
+                    if MAX_FANS > 0 and len(weibo_user.fans) >= MAX_FANS:
+                        finished = True
+                
+                if finished:
+                    break
+                    
+            if finished:
+                break
                 
         weibo_user.save()
 #         self.logger.debug('parse %s finish' % url)
+        self.logger.debug('parse %s finish: add %d friends.' % (url, friend_num))
         
         urls = []
         pages = html.find('div', attrs={'class': 'W_pages', 'node-type': 'pageList'})
         if pages is None:
             pages = html.find('div', attrs={'class': 'WB_cardpage', 'node-type': 'pageList'})
-        if pages is not None:
+        if pages is not None and friend_num > 0: # 如果此次查找没有找到新friend，则退出
             a = pages.find_all('a')
             if len(a) > 0:
                 next_ = a[-1]
-                if next_['class'] == ['W_btn_c'] or 'next' in next_['class']:
+                if next_['class'] == ['W_btn_c'] or 'next' in next_['class'] and not finished:
                     decodes['page'] = int(decodes.get('page', 1)) + 1
                     query_str = urllib.urlencode(decodes)
                     url = '%s?%s' % (url.split('?')[0], query_str)
                     urls.append(url)
                     
                     return urls, bundles
+                else:
+                    return [], bundles
         
         if is_follow is True:
             if is_new_mode:
